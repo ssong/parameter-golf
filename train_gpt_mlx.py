@@ -74,6 +74,10 @@ class Hyperparameters:
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    # MLP_VARIANT: "relu2" (baseline), "swiglu", "reglu2", "mixed", "shared_gate"
+    mlp_variant: str = os.environ.get("MLP_VARIANT", "relu2")
+    # For "mixed" variant: layers >= this index use SwiGLU, below use relu²
+    mixed_swiglu_from_layer: int = int(os.environ.get("MIXED_SWIGLU_FROM_LAYER", 5))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
@@ -339,16 +343,44 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
-    def __init__(self, dim: int, mlp_mult: int):
+    """MLP with selectable activation variant.
+
+    Variants (all iso-param when gated uses 2/3 hidden):
+      relu2:        relu(fc(x))^2 → proj        (2 matmuls, baseline)
+      swiglu:       silu(gate(x)) * up(x) → down (3 matmuls, LLaMA-style)
+      reglu2:       relu(gate(x))^2 * up(x) → down (3 matmuls, sparse + gated)
+      shared_gate:  like swiglu but gate weight is set externally (shared across layers)
+    """
+    def __init__(self, dim: int, mlp_mult: int, variant: str = "relu2", shared_gate_weight=None):
         super().__init__()
-        hidden = dim * mlp_mult
-        self.fc = CastedLinear(dim, hidden)
-        self.proj = CastedLinear(hidden, dim)
+        self.variant = variant
+        if variant == "relu2":
+            hidden = dim * mlp_mult
+            self.fc = CastedLinear(dim, hidden)
+            self.proj = CastedLinear(hidden, dim)
+        elif variant in ("swiglu", "reglu2", "shared_gate"):
+            hidden = int(2 * dim * mlp_mult / 3)
+            if variant == "shared_gate" and shared_gate_weight is not None:
+                self.gate = CastedLinear(dim, hidden)
+                self.gate.weight = shared_gate_weight
+            else:
+                self.gate = CastedLinear(dim, hidden)
+            self.up = CastedLinear(dim, hidden)
+            self.down = CastedLinear(hidden, dim)
+        else:
+            raise ValueError(f"Unknown MLP variant: {variant}")
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = nn.relu(self.fc(x))
-        return self.proj(x * x)
+        if self.variant == "relu2":
+            x = nn.relu(self.fc(x))
+            return self.proj(x * x)
+        elif self.variant == "swiglu":
+            return self.down(nn.silu(self.gate(x)) * self.up(x))
+        elif self.variant == "reglu2":
+            g = nn.relu(self.gate(x))
+            return self.down((g * g) * self.up(x))
+        elif self.variant == "shared_gate":
+            return self.down(nn.silu(self.gate(x)) * self.up(x))
 
 
 class Block(nn.Module):
@@ -360,12 +392,14 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        mlp_variant: str = "relu2",
+        shared_gate_weight=None,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, variant=mlp_variant, shared_gate_weight=shared_gate_weight)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -386,7 +420,7 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, mlp_variant: str = "relu2", mixed_swiglu_from_layer: int = 5):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -398,15 +432,30 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
-        self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
-        ]
+        # For shared_gate: create one gate weight shared across all layers
+        shared_gate_w = None
+        if mlp_variant == "shared_gate":
+            hidden = int(2 * dim * mlp_mult / 3)
+            shared_gate_w = mx.random.normal((hidden, dim)).astype(COMPUTE_DTYPE) * (1.0 / (dim ** 0.5))
+
+        self.blocks = []
+        for i in range(num_layers):
+            if mlp_variant == "mixed":
+                layer_variant = "swiglu" if i >= mixed_swiglu_from_layer else "relu2"
+            else:
+                layer_variant = mlp_variant
+            self.blocks.append(
+                Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                      mlp_variant=layer_variant, shared_gate_weight=shared_gate_w)
+            )
         self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
-            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+            if b.mlp.variant == "relu2":
+                b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+            else:
+                b.mlp.down.weight = mx.zeros_like(b.mlp.down.weight)
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
@@ -897,6 +946,8 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        mlp_variant=args.mlp_variant,
+        mixed_swiglu_from_layer=args.mixed_swiglu_from_layer,
     )
     opt = SplitOptimizers(model, args)
 
